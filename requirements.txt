@@ -1,0 +1,5 @@
+requests
+yt-dlp
+
+# Also required for the PowerShell pipeline, but install separately:
+# ffmpeg
