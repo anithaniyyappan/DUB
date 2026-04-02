@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ import requests
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 CAPTION_DIR = BASE_DIR / "downloads" / "captions"
+SOURCE_AUDIO_DIR = BASE_DIR / "downloads" / "audio"
 DEFAULT_SLANG_DICT_PATH = BASE_DIR / "tamil_slang_dictionary.json"
 API_URL = "https://api.sarvam.ai/translate"
 CHAT_URL = "https://api.sarvam.ai/v1/chat/completions"
@@ -22,6 +24,200 @@ SAFE_CHUNK_SIZE = 1800
 STYLE_CHUNK_SIZE = 1400
 MIN_LENGTH_RATIO = 0.7
 CHUNKED_STT_SECONDS = 30
+
+
+def stem_without_tamil_suffix(path: Path) -> str:
+    stem = path.stem
+    if stem.endswith(".ta-IN"):
+        return stem[:-6]
+    return stem
+
+
+def extract_video_id_from_name(name: str) -> str | None:
+    match = re.search(r"\[([^\[\]]+)\]$", name.strip())
+    if match:
+        return match.group(1)
+    return None
+
+
+def find_matching_source_audio(caption_path: Path) -> Path | None:
+    if not SOURCE_AUDIO_DIR.exists():
+        return None
+
+    base_stem = stem_without_tamil_suffix(caption_path)
+    direct_matches = [p for p in SOURCE_AUDIO_DIR.iterdir() if p.is_file() and p.stem == base_stem]
+    if direct_matches:
+        return max(direct_matches, key=lambda p: p.stat().st_mtime)
+
+    video_id = extract_video_id_from_name(base_stem)
+    if video_id:
+        id_matches = [p for p in SOURCE_AUDIO_DIR.iterdir() if p.is_file() and f"[{video_id}]" in p.stem]
+        if id_matches:
+            return max(id_matches, key=lambda p: p.stat().st_mtime)
+
+    return None
+
+
+def ffprobe_duration_seconds(path: Path) -> float:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe failed for {path}: {result.stderr}")
+    try:
+        return float(result.stdout.strip())
+    except ValueError as exc:
+        raise RuntimeError(f"Could not parse duration from ffprobe output: {result.stdout}") from exc
+
+
+def detect_speech_windows_ms(
+    audio_path: Path,
+    silence_noise_db: str = "-32dB",
+    silence_min_sec: float = 0.25,
+    min_speech_ms: int = 120,
+) -> list[tuple[int, int]]:
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-i",
+        str(audio_path),
+        "-af",
+        f"silencedetect=noise={silence_noise_db}:d={silence_min_sec}",
+        "-f",
+        "null",
+        "-",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg silencedetect failed: {result.stderr}")
+
+    silence_start_re = re.compile(r"silence_start:\s*([0-9.]+)")
+    silence_end_re = re.compile(r"silence_end:\s*([0-9.]+)")
+    events: list[tuple[str, float]] = []
+
+    for line in result.stderr.splitlines():
+        m_start = silence_start_re.search(line)
+        if m_start:
+            events.append(("start", float(m_start.group(1))))
+            continue
+        m_end = silence_end_re.search(line)
+        if m_end:
+            events.append(("end", float(m_end.group(1))))
+
+    total_sec = ffprobe_duration_seconds(audio_path)
+    speech_start_sec = 0.0
+    windows: list[tuple[int, int]] = []
+
+    for event_type, timestamp_sec in events:
+        if event_type == "start":
+            speech_end_sec = max(0.0, timestamp_sec)
+            if speech_end_sec > speech_start_sec:
+                start_ms = int(round(speech_start_sec * 1000.0))
+                end_ms = int(round(speech_end_sec * 1000.0))
+                if end_ms - start_ms >= min_speech_ms:
+                    windows.append((start_ms, end_ms))
+        elif event_type == "end":
+            speech_start_sec = max(0.0, timestamp_sec)
+
+    if total_sec > speech_start_sec:
+        start_ms = int(round(speech_start_sec * 1000.0))
+        end_ms = int(round(total_sec * 1000.0))
+        if end_ms - start_ms >= min_speech_ms:
+            windows.append((start_ms, end_ms))
+
+    return windows
+
+
+def assign_segments_by_weight(
+    segments: list[dict[str, Any]],
+    ranges: list[tuple[int, int]],
+    timing_source: str,
+) -> list[dict[str, Any]]:
+    if not segments or not ranges:
+        return segments
+
+    total_ms = sum(max(0, end - start) for start, end in ranges)
+    if total_ms <= 0:
+        return segments
+
+    weights = [max(1, len(str(seg.get("source_text", "")))) for seg in segments]
+    weight_sum = sum(weights) or len(segments)
+    target_durations = [max(120, int(round(total_ms * (w / weight_sum)))) for w in weights]
+
+    diff = total_ms - sum(target_durations)
+    target_durations[-1] = max(120, target_durations[-1] + diff)
+
+    range_idx = 0
+    cursor_ms = ranges[0][0]
+
+    for segment, duration_ms in zip(segments, target_durations):
+        remaining = duration_ms
+        start_ms = cursor_ms
+        last_pos = cursor_ms
+
+        while remaining > 0 and range_idx < len(ranges):
+            win_start, win_end = ranges[range_idx]
+            if cursor_ms < win_start:
+                cursor_ms = win_start
+                if start_ms < win_start:
+                    start_ms = win_start
+
+            available = win_end - cursor_ms
+            if available <= 0:
+                range_idx += 1
+                if range_idx < len(ranges):
+                    cursor_ms = ranges[range_idx][0]
+                continue
+
+            take = min(remaining, available)
+            cursor_ms += take
+            last_pos = cursor_ms
+            remaining -= take
+
+            if remaining > 0:
+                range_idx += 1
+                if range_idx < len(ranges):
+                    cursor_ms = ranges[range_idx][0]
+
+        segment["start_ms"] = int(start_ms)
+        segment["end_ms"] = int(max(start_ms + 120, last_pos))
+        segment["timing_source"] = timing_source
+
+    return segments
+
+
+def apply_timing_to_segments(segments: list[dict[str, Any]], source_audio: Path | None) -> list[dict[str, Any]]:
+    has_explicit_timing = any(("start_ms" in s and "end_ms" in s) for s in segments)
+    if has_explicit_timing:
+        return segments
+
+    if source_audio and source_audio.exists():
+        windows = detect_speech_windows_ms(source_audio)
+        if windows:
+            return assign_segments_by_weight(segments, windows, "detected_speech_windows")
+
+        total_ms = int(round(ffprobe_duration_seconds(source_audio) * 1000.0))
+        if total_ms > 0:
+            return assign_segments_by_weight(segments, [(0, total_ms)], "equal_split_fallback")
+
+    return segments
+
+
+def format_ms(ms: float | int) -> str:
+    total_ms = max(0, int(round(float(ms))))
+    h = total_ms // 3_600_000
+    m = (total_ms % 3_600_000) // 60_000
+    s = (total_ms % 60_000) // 1_000
+    ms_part = total_ms % 1_000
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms_part:03d}"
 
 
 def safe_console(text: str) -> str:
@@ -262,6 +458,21 @@ def render_segments_text(segments: list[dict[str, Any]], text_key: str) -> str:
         if lines:
             lines.extend([""] * int(segment.get("blank_lines_before", 0)))
         lines.append(text)
+    return "\n".join(lines).strip()
+
+
+def render_timed_segments_text(segments: list[dict[str, Any]], text_key: str) -> str:
+    lines: list[str] = []
+    for segment in segments:
+        text = str(segment.get(text_key, "")).strip()
+        if not text:
+            continue
+        start_ms = segment.get("start_ms")
+        end_ms = segment.get("end_ms")
+        if start_ms is not None and end_ms is not None:
+            lines.append(f"[{format_ms(start_ms)} --> {format_ms(end_ms)}] {text}")
+        else:
+            lines.append(text)
     return "\n".join(lines).strip()
 
 
@@ -546,6 +757,8 @@ def main() -> None:
     slang_guidance = build_slang_guidance(slang_dict)
 
     source_segments = load_source_segments(caption_path, input_text)
+    source_audio = find_matching_source_audio(caption_path)
+    source_segments = apply_timing_to_segments(source_segments, source_audio)
     translated_groups: list[dict[str, Any]] = []
     style_groups: list[dict[str, Any]] = []
     spell_groups: list[dict[str, Any]] = []
@@ -619,9 +832,9 @@ def main() -> None:
         segment_record["final_text"] = final_segment_text
         output_segments.append(segment_record)
 
-    final_text = render_segments_text(output_segments, "final_text")
+    final_text = render_timed_segments_text(output_segments, "final_text")
     if not final_text.strip():
-        final_text = render_segments_text(output_segments, "translated_text")
+        final_text = render_timed_segments_text(output_segments, "translated_text")
 
     out_txt = caption_path.with_name(f"{caption_path.stem}.{args.target_lang}.txt")
     out_json = caption_path.with_name(f"{caption_path.stem}.{args.target_lang}.json")
@@ -632,6 +845,7 @@ def main() -> None:
             {
                 "source_file": str(caption_path),
                 "source_json": str(caption_path.with_suffix(".json")),
+                "source_audio": str(source_audio) if source_audio else "",
                 "style": args.style,
                 "slang_dict": str(slang_dict_path) if slang_dict_path else "",
                 "translated_text": final_text,

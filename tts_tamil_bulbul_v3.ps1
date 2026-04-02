@@ -22,6 +22,15 @@ param(
 
     [Parameter(Mandatory = $false)]
     [int]$MaxGapMs = 4000
+    ,
+    [Parameter(Mandatory = $false)]
+    [switch]$NoSyncOriginal,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$ForceGlobalSync,
+
+    [Parameter(Mandatory = $false)]
+    [double]$SyncToleranceSec = 0.15
 )
 
 $ErrorActionPreference = "Stop"
@@ -59,7 +68,8 @@ $commandArgs = @(
     "--sample-rate", $SampleRate,
     "--pause-ms", $PauseMs,
     "--blank-line-pause-ms", $BlankLinePauseMs,
-    "--max-gap-ms", $MaxGapMs
+    "--max-gap-ms", $MaxGapMs,
+    "--sync-tolerance-sec", $SyncToleranceSec
 )
 
 if ($CaptionPath) {
@@ -69,6 +79,14 @@ if ($CaptionPath) {
         exit 1
     }
     $commandArgs += @("--caption", $resolvedCaptionPath)
+}
+
+if ($NoSyncOriginal) {
+    $commandArgs += "--no-sync-original"
+}
+
+if ($ForceGlobalSync) {
+    $commandArgs += "--force-global-sync"
 }
 
 & python @commandArgs

@@ -6,7 +6,9 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import wave
 from pathlib import Path
 from typing import Any
@@ -18,12 +20,14 @@ BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 CAPTION_DIR = BASE_DIR / "downloads" / "captions"
 OUTPUT_DIR = BASE_DIR / "downloads" / "tts"
+SOURCE_AUDIO_DIR = BASE_DIR / "downloads" / "audio"
 TTS_URL = "https://api.sarvam.ai/text-to-speech"
 MAX_CHARS_V3 = 2500
 SAFE_CHUNK_SIZE = 2000
 DEFAULT_PAUSE_MS = 350
 DEFAULT_BLANK_LINE_PAUSE_MS = 650
 DEFAULT_MAX_GAP_MS = 4000
+DEFAULT_SYNC_TOLERANCE_SEC = 0.15
 
 
 def safe_console(text: str) -> str:
@@ -93,6 +97,129 @@ def chunk_text(text: str, chunk_size: int = SAFE_CHUNK_SIZE) -> list[str]:
         chunks = [text[:chunk_size]]
 
     return [c for c in chunks if c.strip()]
+
+
+def stem_without_tamil_suffix(path: Path) -> str:
+    stem = path.stem
+    if stem.endswith(".ta-IN"):
+        return stem[:-6]
+    return stem
+
+
+def extract_video_id_from_name(name: str) -> str | None:
+    match = re.search(r"\[([^\[\]]+)\]$", name.strip())
+    if match:
+        return match.group(1)
+    return None
+
+
+def find_matching_source_audio(caption_path: Path) -> Path | None:
+    if not SOURCE_AUDIO_DIR.exists():
+        return None
+
+    base_stem = stem_without_tamil_suffix(caption_path)
+    direct_matches = [p for p in SOURCE_AUDIO_DIR.iterdir() if p.is_file() and p.stem == base_stem]
+    if direct_matches:
+        return max(direct_matches, key=lambda p: p.stat().st_mtime)
+
+    video_id = extract_video_id_from_name(base_stem)
+    if video_id:
+        id_matches = [p for p in SOURCE_AUDIO_DIR.iterdir() if p.is_file() and f"[{video_id}]" in p.stem]
+        if id_matches:
+            return max(id_matches, key=lambda p: p.stat().st_mtime)
+
+    return None
+
+
+def ffprobe_duration_seconds(path: Path) -> float:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe failed for {path}: {result.stderr}")
+    try:
+        return float(result.stdout.strip())
+    except ValueError as exc:
+        raise RuntimeError(f"Could not parse duration from ffprobe output: {result.stdout}") from exc
+
+
+def build_atempo_chain(speed_factor: float) -> str:
+    if speed_factor <= 0:
+        raise ValueError("Invalid speed factor.")
+
+    factors: list[float] = []
+    remaining = speed_factor
+
+    while remaining > 2.0:
+        factors.append(2.0)
+        remaining /= 2.0
+
+    while remaining < 0.5:
+        factors.append(0.5)
+        remaining /= 0.5
+
+    if abs(remaining - 1.0) > 1e-4:
+        factors.append(remaining)
+
+    if not factors:
+        return "atempo=1.0"
+
+    return ",".join(f"atempo={f:.6f}" for f in factors)
+
+
+def sync_wav_to_target_duration(
+    wav_path: Path,
+    target_seconds: float,
+    tolerance_seconds: float = DEFAULT_SYNC_TOLERANCE_SEC,
+) -> dict[str, float | bool]:
+    current_seconds = ffprobe_duration_seconds(wav_path)
+    delta = current_seconds - target_seconds
+
+    if abs(delta) <= tolerance_seconds or target_seconds <= 0:
+        return {
+            "synced": False,
+            "before_seconds": current_seconds,
+            "after_seconds": current_seconds,
+            "target_seconds": target_seconds,
+            "speed_factor": 1.0,
+        }
+
+    speed_factor = current_seconds / target_seconds
+    atempo_chain = build_atempo_chain(speed_factor)
+
+    with tempfile.TemporaryDirectory(prefix="sarvam_sync_") as tmp:
+        temp_out = Path(tmp) / "synced.wav"
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(wav_path),
+            "-filter:a",
+            atempo_chain,
+            str(temp_out),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg sync failed: {result.stderr}")
+
+        wav_path.write_bytes(temp_out.read_bytes())
+
+    after_seconds = ffprobe_duration_seconds(wav_path)
+    return {
+        "synced": True,
+        "before_seconds": current_seconds,
+        "after_seconds": after_seconds,
+        "target_seconds": target_seconds,
+        "speed_factor": speed_factor,
+    }
 
 
 def load_json_if_exists(path: Path) -> Any | None:
@@ -209,11 +336,129 @@ def infer_pause_ms(
     return inferred
 
 
+def detect_speech_windows_ms(
+    audio_path: Path,
+    silence_noise_db: str = "-32dB",
+    silence_min_sec: float = 0.25,
+    min_speech_ms: int = 120,
+) -> list[tuple[int, int]]:
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-i",
+        str(audio_path),
+        "-af",
+        f"silencedetect=noise={silence_noise_db}:d={silence_min_sec}",
+        "-f",
+        "null",
+        "-",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg silencedetect failed: {result.stderr}")
+
+    stderr = result.stderr
+    silence_start_re = re.compile(r"silence_start:\s*([0-9.]+)")
+    silence_end_re = re.compile(r"silence_end:\s*([0-9.]+)")
+
+    events: list[tuple[str, float]] = []
+    for line in stderr.splitlines():
+        m_start = silence_start_re.search(line)
+        if m_start:
+            events.append(("start", float(m_start.group(1))))
+            continue
+        m_end = silence_end_re.search(line)
+        if m_end:
+            events.append(("end", float(m_end.group(1))))
+
+    total_sec = ffprobe_duration_seconds(audio_path)
+    speech_start_sec = 0.0
+    windows: list[tuple[int, int]] = []
+
+    for event_type, timestamp_sec in events:
+        if event_type == "start":
+            speech_end_sec = max(0.0, timestamp_sec)
+            if speech_end_sec > speech_start_sec:
+                start_ms = int(round(speech_start_sec * 1000.0))
+                end_ms = int(round(speech_end_sec * 1000.0))
+                if end_ms - start_ms >= min_speech_ms:
+                    windows.append((start_ms, end_ms))
+        elif event_type == "end":
+            speech_start_sec = max(0.0, timestamp_sec)
+
+    if total_sec > speech_start_sec:
+        start_ms = int(round(speech_start_sec * 1000.0))
+        end_ms = int(round(total_sec * 1000.0))
+        if end_ms - start_ms >= min_speech_ms:
+            windows.append((start_ms, end_ms))
+
+    return windows
+
+
+def assign_segments_to_speech_windows(
+    segments: list[dict[str, Any]],
+    windows: list[tuple[int, int]],
+) -> list[dict[str, Any]]:
+    if not segments or not windows:
+        return segments
+
+    total_speech_ms = sum(max(0, end - start) for start, end in windows)
+    if total_speech_ms <= 0:
+        return segments
+
+    weights = [max(1, len(str(seg.get("text", "")))) for seg in segments]
+    weight_sum = sum(weights) or len(segments)
+    target_durations = [max(120, int(round(total_speech_ms * (w / weight_sum)))) for w in weights]
+
+    # Normalize to total speech duration.
+    diff = total_speech_ms - sum(target_durations)
+    target_durations[-1] = max(120, target_durations[-1] + diff)
+
+    window_idx = 0
+    cursor_ms = windows[0][0]
+
+    for segment, duration_ms in zip(segments, target_durations):
+        remaining = duration_ms
+        start_ms = cursor_ms
+        last_pos = cursor_ms
+
+        while remaining > 0 and window_idx < len(windows):
+            win_start, win_end = windows[window_idx]
+            if cursor_ms < win_start:
+                cursor_ms = win_start
+                if start_ms < win_start:
+                    start_ms = win_start
+
+            available = win_end - cursor_ms
+            if available <= 0:
+                window_idx += 1
+                if window_idx < len(windows):
+                    cursor_ms = windows[window_idx][0]
+                continue
+
+            take = min(remaining, available)
+            cursor_ms += take
+            last_pos = cursor_ms
+            remaining -= take
+
+            if remaining > 0:
+                window_idx += 1
+                if window_idx < len(windows):
+                    cursor_ms = windows[window_idx][0]
+
+        segment["start_ms"] = int(start_ms)
+        segment["end_ms"] = int(max(start_ms + 120, last_pos))
+        segment["timing_source"] = "detected_speech_windows"
+
+    return segments
+
+
 def load_tts_segments(
     caption_path: Path,
     pause_ms: int,
     blank_line_pause_ms: int,
     max_gap_ms: int,
+    source_audio_path: Path | None = None,
 ) -> list[dict[str, Any]]:
     text = caption_path.read_text(encoding="utf-8")
     if not text.strip():
@@ -272,7 +517,25 @@ def load_tts_segments(
     if not segments:
         raise ValueError("No valid caption segments found.")
 
+    has_explicit_timing = any(("start_ms" in s and "end_ms" in s) for s in segments)
+    if (not has_explicit_timing) and source_audio_path and source_audio_path.exists():
+        windows = detect_speech_windows_ms(source_audio_path)
+        if windows:
+            segments = assign_segments_to_speech_windows(segments, windows)
+
+    if segments:
+        first_start = segments[0].get("start_ms")
+        if first_start is not None:
+            segments[0]["pause_before_ms"] = max(0, int(round(float(first_start))))
+        else:
+            segments[0]["pause_before_ms"] = 0
+
     for idx, segment in enumerate(segments):
+        start_ms = segment.get("start_ms")
+        end_ms = segment.get("end_ms")
+        if start_ms is not None and end_ms is not None and end_ms > start_ms:
+            segment["target_duration_ms"] = max(100, int(round(float(end_ms) - float(start_ms))))
+
         if idx == len(segments) - 1:
             segment["pause_after_ms"] = 0
             continue
@@ -367,6 +630,49 @@ def build_silence_frames(duration_ms: int, params: wave._wave_params) -> bytes:
     return b"\x00" * frame_count * bytes_per_frame
 
 
+def wav_duration_ms(audio_bytes: bytes) -> float:
+    with wave.open(io.BytesIO(audio_bytes), "rb") as wav_in:
+        frames = wav_in.getnframes()
+        framerate = wav_in.getframerate()
+    if framerate <= 0:
+        return 0.0
+    return (frames / float(framerate)) * 1000.0
+
+
+def fit_clip_to_target_duration(audio_bytes: bytes, target_ms: float) -> bytes:
+    target_ms = max(100.0, float(target_ms))
+    current_ms = wav_duration_ms(audio_bytes)
+    if current_ms <= 0:
+        return audio_bytes
+
+    ratio = current_ms / target_ms
+    if 0.98 <= ratio <= 1.02:
+        return audio_bytes
+
+    atempo_chain = build_atempo_chain(ratio)
+    target_sec = target_ms / 1000.0
+
+    with tempfile.TemporaryDirectory(prefix="sarvam_fit_") as tmp:
+        in_path = Path(tmp) / "in.wav"
+        out_path = Path(tmp) / "out.wav"
+        in_path.write_bytes(audio_bytes)
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(in_path),
+            "-filter:a",
+            f"{atempo_chain},apad=pad_dur={target_sec:.3f},atrim=duration={target_sec:.3f}",
+            str(out_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg duration-fit failed: {result.stderr}")
+
+        return out_path.read_bytes()
+
+
 def stitch_wav_clips(clips: list[dict[str, Any]]) -> bytes:
     if not clips:
         raise ValueError("No audio clips to stitch.")
@@ -384,6 +690,10 @@ def stitch_wav_clips(clips: list[dict[str, Any]]) -> bytes:
                 wav_out.setframerate(params.framerate)
             else:
                 validate_wav_params(reference_params, params)
+
+            pause_before_ms = max(0, int(round(float(clip.get("pause_before_ms", 0) or 0))))
+            if pause_before_ms and reference_params is not None:
+                wav_out.writeframes(build_silence_frames(pause_before_ms, reference_params))
 
             wav_out.writeframes(frames)
 
@@ -440,6 +750,9 @@ def main() -> None:
     parser.add_argument("--pause-ms", type=int, default=DEFAULT_PAUSE_MS, help="Fallback pause after each caption line in milliseconds.")
     parser.add_argument("--blank-line-pause-ms", type=int, default=DEFAULT_BLANK_LINE_PAUSE_MS, help="Extra fallback pause for blank lines between caption segments.")
     parser.add_argument("--max-gap-ms", type=int, default=DEFAULT_MAX_GAP_MS, help="Maximum silence inserted from timing metadata, in milliseconds.")
+    parser.add_argument("--no-sync-original", action="store_true", help="Disable duration sync with original source audio.")
+    parser.add_argument("--force-global-sync", action="store_true", help="Apply whole-file duration sync even when segment timestamps are used.")
+    parser.add_argument("--sync-tolerance-sec", type=float, default=DEFAULT_SYNC_TOLERANCE_SEC, help="Skip sync if duration difference is below this value (seconds).")
     args = parser.parse_args()
 
     api_key = read_env_value(ENV_PATH, "SARVAM_API_KEY")
@@ -450,11 +763,14 @@ def main() -> None:
     if not caption_path.exists():
         raise FileNotFoundError(f"Caption file not found: {caption_path}")
 
+    source_audio = find_matching_source_audio(caption_path)
+
     segments = load_tts_segments(
         caption_path=caption_path,
         pause_ms=args.pause_ms,
         blank_line_pause_ms=args.blank_line_pause_ms,
         max_gap_ms=args.max_gap_ms,
+        source_audio_path=source_audio,
     )
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -473,18 +789,61 @@ def main() -> None:
             temperature=args.temperature,
             sample_rate=args.sample_rate,
         )
+        target_duration_ms = segment.get("target_duration_ms")
+        if target_duration_ms is not None:
+            audio_bytes = fit_clip_to_target_duration(audio_bytes, float(target_duration_ms))
+
+        pause_before_ms = max(0, int(segment.get("pause_before_ms", 0) or 0))
         pause_after_ms = max(0, int(segment.get("pause_after_ms", 0) or 0))
-        audio_clips.append({"audio_bytes": audio_bytes, "pause_after_ms": pause_after_ms})
+        audio_clips.append(
+            {
+                "audio_bytes": audio_bytes,
+                "pause_before_ms": pause_before_ms,
+                "pause_after_ms": pause_after_ms,
+            }
+        )
         total_api_chunks += chunk_count
-        total_inserted_pause_ms += pause_after_ms
+        total_inserted_pause_ms += (pause_before_ms + pause_after_ms)
 
     out_path.write_bytes(stitch_wav_clips(audio_clips))
+
+    sync_info: dict[str, float | bool] | None = None
+    has_segment_timing = any(
+        ("start_ms" in segment and "end_ms" in segment) for segment in segments
+    )
+    should_global_sync = (
+        (not args.no_sync_original)
+        and source_audio
+        and source_audio.exists()
+        and (args.force_global_sync or not has_segment_timing)
+    )
+
+    if should_global_sync:
+        target_seconds = ffprobe_duration_seconds(source_audio)
+        sync_info = sync_wav_to_target_duration(
+            wav_path=out_path,
+            target_seconds=target_seconds,
+            tolerance_seconds=max(0.0, args.sync_tolerance_sec),
+        )
 
     print("Source caption:", safe_console(str(caption_path)))
     print("Output audio:", safe_console(str(out_path)))
     print("Segments used:", len(segments))
     print("TTS API chunks:", total_api_chunks)
     print("Inserted pause (ms):", total_inserted_pause_ms)
+    if source_audio:
+        print("Matched source audio:", safe_console(str(source_audio)))
+        print("Segment timestamp mode:", has_segment_timing)
+        if sync_info:
+            print("Sync applied:", bool(sync_info.get("synced", False)))
+            print("Source duration (s):", round(float(sync_info.get("target_seconds", 0.0)), 3))
+            print("TTS before sync (s):", round(float(sync_info.get("before_seconds", 0.0)), 3))
+            print("TTS after sync (s):", round(float(sync_info.get("after_seconds", 0.0)), 3))
+            print("Speed factor:", round(float(sync_info.get("speed_factor", 1.0)), 4))
+        else:
+            print("Sync applied: False (segment timestamps prioritized)")
+    else:
+        print("Matched source audio: none (sync skipped)")
 
 
 if __name__ == "__main__":
